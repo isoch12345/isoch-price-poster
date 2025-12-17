@@ -2,7 +2,7 @@ name: Price upload reminder
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 7:30 UTC = 13:00 IST
+    - cron: "30 7 * * *"   # 07:30 UTC = 13:00 IST
   workflow_dispatch:
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check log + send reminder if missing
+      - name: Check log + remind purchase if missing
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -31,7 +31,7 @@ jobs:
             with open(log_path, "r", encoding="utf-8") as f:
               for line in f:
                 line=line.strip()
-                if not line: 
+                if not line:
                   continue
                 try:
                   obj=json.loads(line)
@@ -45,13 +45,16 @@ jobs:
             print("Already sent today:", today)
             raise SystemExit(0)
 
-          to_list = [x.strip() for x in os.environ["PURCHASE_REMIND_TO"].split(",") if x.strip()]
-          subj = f"Reminder: Price update not sent yet ({today})"
+          to_list = [x.strip() for x in os.environ.get("PURCHASE_REMIND_TO","").split(",") if x.strip()]
+          if not to_list:
+            to_list = ["purchase@innovativesoch.com"]
+
+          subj = f"Reminder: Price update NOT sent yet ({today})"
           body = (
-            f"Hi Team,\n\n"
-            f"This is a reminder that today's price update has not been sent yet.\n"
-            f"Please upload the Excel in the ISOCH Price Poster app and send to sales.\n\n"
-            f"Regards,\nISOCH System\n"
+            "Hi Team,\n\n"
+            "This is a reminder that today's price update has not been sent yet.\n"
+            "Please upload Excel in the ISOCH Price Poster app and click Generate & Send.\n\n"
+            "Regards,\nISOCH System\n"
           )
 
           msg = MIMEText(body)
