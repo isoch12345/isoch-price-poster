@@ -8,16 +8,17 @@ from email import encoders
 import pandas as pd
 import requests
 from PIL import Image, ImageDraw, ImageFont
-
 import streamlit as st
 
 # ---------------- CONFIG ----------------
 CANVAS_W, CANVAS_H = 1080, 1920
 COMPANY_NAME = "INNOVATIVE SOCH"
 TEMPLATE_PATH = "template_light.png"
-DEFAULT_PURCHASE_REMIND_TO = ["purchase@innovativesoch.com"]
 
-DEFAULT_SALES_TEAM = [
+MAPPING_PATH = "config/destination_mapping.json"
+LOG_PATH = "logs/price_sent_log.jsonl"
+
+DEFAULT_TEAM = [
     "info@innovativesoch.com",
     "sapnarani@innovativesoch.com",
     "sandeep@innovativesoch.com",
@@ -29,6 +30,7 @@ DISCLAIMER = "Prices are indicative. Final order confirmation by call."
 # ----------------------------------------
 
 
+# ========== helpers ==========
 def try_font(paths, size):
     for p in paths:
         try:
@@ -37,13 +39,11 @@ def try_font(paths, size):
             pass
     return ImageFont.load_default()
 
-
 def money(v):
     try:
         return f"{float(v):.2f}"
     except Exception:
         return ""
-
 
 def wrap_text(draw, text, font, max_width):
     words = text.split()
@@ -60,7 +60,6 @@ def wrap_text(draw, text, font, max_width):
         lines.append(line)
     return lines
 
-
 def load_template():
     if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(f"Missing {TEMPLATE_PATH}. Upload it to repo root.")
@@ -68,7 +67,6 @@ def load_template():
     if img.size != (CANVAS_W, CANVAS_H):
         img = img.resize((CANVAS_W, CANVAS_H))
     return img
-
 
 def parse_excel(excel_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(excel_bytes))
@@ -94,6 +92,78 @@ def parse_excel(excel_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+# ========== GitHub read/write ==========
+def _gh_cfg():
+    owner = st.secrets.get("GITHUB_OWNER", "")
+    repo = st.secrets.get("GITHUB_REPO", "")
+    branch = st.secrets.get("GITHUB_BRANCH", "master")
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    if not (owner and repo and token):
+        raise ValueError("Missing GitHub secrets: GITHUB_OWNER/GITHUB_REPO/GITHUB_BRANCH/GITHUB_TOKEN")
+    return owner, repo, branch, token
+
+def gh_read_text(path: str) -> tuple[str, str | None]:
+    owner, repo, branch, token = _gh_cfg()
+    api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+    r = requests.get(api, headers=headers, params={"ref": branch}, timeout=30)
+    if r.status_code == 200:
+        sha = r.json()["sha"]
+        content_b64 = r.json().get("content", "")
+        content = base64.b64decode(content_b64).decode("utf-8", errors="ignore")
+        return content, sha
+    if r.status_code == 404:
+        return "", None
+    raise ValueError(f"GitHub read failed: {r.status_code} {r.text}")
+
+def gh_write_text(path: str, new_content: str, message: str, sha: str | None):
+    owner, repo, branch, token = _gh_cfg()
+    api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+    payload = {
+        "message": message,
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("utf-8"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    u = requests.put(api, headers=headers, json=payload, timeout=30)
+    if u.status_code not in (200, 201):
+        raise ValueError(f"GitHub write failed: {u.status_code} {u.text}")
+
+def load_mapping_from_github() -> dict:
+    content, _ = gh_read_text(MAPPING_PATH)
+    if not content.strip():
+        return {}
+    return json.loads(content)
+
+def save_mapping_to_github(mapping: dict):
+    content, sha = gh_read_text(MAPPING_PATH)
+    new_content = json.dumps(mapping, indent=2, ensure_ascii=False) + "\n"
+    gh_write_text(MAPPING_PATH, new_content, "update destination mapping", sha)
+
+def append_log_to_github(line_obj: dict):
+    content, sha = gh_read_text(LOG_PATH)
+    new_line = json.dumps(line_obj, ensure_ascii=False)
+    new_content = (content.rstrip("\n") + "\n" + new_line + "\n") if content.strip() else (new_line + "\n")
+    gh_write_text(LOG_PATH, new_content, f"log price sent {line_obj.get('date')}", sha)
+
+def tail_logs_from_github(n=20) -> list[dict]:
+    content, _ = gh_read_text(LOG_PATH)
+    lines = [x.strip() for x in content.splitlines() if x.strip()]
+    out = []
+    for line in lines[-n:]:
+        try:
+            out.append(json.loads(line))
+        except:
+            pass
+    return out
+
+
+# ========== Image generation ==========
 def build_destination_poster(template_img, destination, rows, date_str, email_line) -> bytes:
     img = template_img.copy()
     draw = ImageDraw.Draw(img)
@@ -113,24 +183,20 @@ def build_destination_poster(template_img, destination, rows, date_str, email_li
     LINE = (150, 135, 125)
     pad = 90
 
-    # Header
     y = 210
     draw.text((pad, y), f"TODAY PRICES — {destination.upper()}", fill=DARK, font=TITLE)
     y += 62
-
     w = draw.textlength(date_str, font=H3)
     draw.text((CANVAS_W - pad - w, y), date_str, fill=DARK, font=H3)
 
-    # Table
     table_left, table_right = pad, CANVAS_W - pad
     table_top = 410
-    col_item_w = int((table_right - table_left) * 0.68)
 
     y = table_top
     draw.line((table_left, y, table_right, y), fill=LINE, width=3)
     y += 16
     draw.text((table_left + 10, y), "ITEM", fill=DARK, font=H2)
-    draw.text((table_left + col_item_w + 10, y), "PRICE (₹/KG)", fill=DARK, font=H2)
+    draw.text((table_right - 270, y), "PRICE (₹/KG)", fill=DARK, font=H2)
     y += 54
     draw.line((table_left, y, table_right, y), fill=LINE, width=2)
 
@@ -152,7 +218,6 @@ def build_destination_poster(template_img, destination, rows, date_str, email_li
         draw.line((table_left, y + row_h, table_right, y + row_h), fill=LINE, width=1)
         y += row_h - 8
 
-    # Footer
     fy = CANVAS_H - 235
     for line in wrap_text(draw, DISCLAIMER, SMALL, CANVAS_W - 2*pad)[:2]:
         draw.text((pad, fy), line, fill=DARK, font=SMALL)
@@ -167,12 +232,7 @@ def build_destination_poster(template_img, destination, rows, date_str, email_li
     buf.seek(0)
     return buf.getvalue()
 
-
 def build_master_table_image(template_img, df_selected: pd.DataFrame, date_str: str) -> bytes:
-    """
-    One WhatsApp-ready MASTER image.
-    If too many rows, it truncates and adds '...'.
-    """
     img = template_img.copy()
     draw = ImageDraw.Draw(img)
 
@@ -191,9 +251,8 @@ def build_master_table_image(template_img, df_selected: pd.DataFrame, date_str: 
     LINE = (150, 135, 125)
     pad = 90
 
-    # Title
     y = 200
-    draw.text((pad, y), f"MASTER PRICE UPDATE", fill=DARK, font=TITLE)
+    draw.text((pad, y), "MASTER PRICE UPDATE", fill=DARK, font=TITLE)
     w = draw.textlength(date_str, font=H3)
     draw.text((CANVAS_W - pad - w, y + 10), date_str, fill=DARK, font=H3)
 
@@ -201,22 +260,16 @@ def build_master_table_image(template_img, df_selected: pd.DataFrame, date_str: 
     draw.line((pad, y, CANVAS_W - pad, y), fill=LINE, width=3)
     y += 22
 
-    # Content area
-    left = pad
-    right = CANVAS_W - pad
-    col_price_w = 220
-    col_item_right = right - col_price_w
-
-    max_y = CANVAS_H - 320  # keep footer space
+    left, right = pad, CANVAS_W - pad
+    max_y = CANVAS_H - 320
     truncated = False
 
     for dest in sorted(df_selected["Destination"].unique().tolist()):
-        # Destination heading
         if y + 60 > max_y:
             truncated = True
             break
 
-        draw.text((left, y), f"{dest.upper()}", fill=DARK, font=H2)
+        draw.text((left, y), dest.upper(), fill=DARK, font=H2)
         y += 42
         draw.line((left, y, right, y), fill=LINE, width=2)
         y += 12
@@ -231,14 +284,12 @@ def build_master_table_image(template_img, df_selected: pd.DataFrame, date_str: 
             product = str(r["Product"]).strip()
             price = f"₹ {money(r['DeliveredPrice'])}"
 
-            # product (wrap if needed)
-            prod_lines = wrap_text(draw, product, BODY_B, col_item_right - left - 10)
+            prod_lines = wrap_text(draw, product, BODY_B, (right - left - 260))
             prod_line = prod_lines[0] if prod_lines else product
 
             draw.text((left, y), prod_line, fill=DARK, font=BODY_B)
             pw = draw.textlength(price, font=BODY)
             draw.text((right - pw, y), price, fill=DARK, font=BODY)
-
             y += 34
 
         y += 14
@@ -248,7 +299,6 @@ def build_master_table_image(template_img, df_selected: pd.DataFrame, date_str: 
     if truncated:
         draw.text((left, y), "... (More rows truncated)", fill=DARK, font=SMALL)
 
-    # Footer
     fy = CANVAS_H - 240
     draw.line((pad, fy - 20, CANVAS_W - pad, fy - 20), fill=LINE, width=2)
     for line in wrap_text(draw, DISCLAIMER, SMALL, CANVAS_W - 2*pad)[:2]:
@@ -261,6 +311,7 @@ def build_master_table_image(template_img, df_selected: pd.DataFrame, date_str: 
     return buf.getvalue()
 
 
+# ========== Email ==========
 def send_email_with_attachments(to_list, subject, body, attachments: dict):
     host = st.secrets.get("SMTP_HOST", "")
     port = int(st.secrets.get("SMTP_PORT", 465))
@@ -288,55 +339,19 @@ def send_email_with_attachments(to_list, subject, body, attachments: dict):
         server.sendmail(user, to_list, msg.as_string())
 
 
-# -------- GitHub logging (append a JSONL line) --------
-def github_append_log_line(line_obj: dict, path="logs/price_sent_log.jsonl"):
-    owner = st.secrets.get("GITHUB_OWNER", "")
-    repo = st.secrets.get("GITHUB_REPO", "")
-    branch = st.secrets.get("GITHUB_BRANCH", "master")
-    token = st.secrets.get("GITHUB_TOKEN", "")
-
-    if not (owner and repo and token):
-        raise ValueError("GitHub secrets missing: GITHUB_OWNER/GITHUB_REPO/GITHUB_BRANCH/GITHUB_TOKEN")
-
-    api = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-
-    # read current file
-    r = requests.get(api, headers=headers, params={"ref": branch}, timeout=30)
-    if r.status_code == 200:
-        sha = r.json()["sha"]
-        content_b64 = r.json().get("content", "")
-        content = base64.b64decode(content_b64).decode("utf-8", errors="ignore")
-    elif r.status_code == 404:
-        sha = None
-        content = ""
-    else:
-        raise ValueError(f"GitHub read failed: {r.status_code} {r.text}")
-
-    new_line = json.dumps(line_obj, ensure_ascii=False)
-    new_content = (content.rstrip("\n") + "\n" + new_line + "\n") if content.strip() else (new_line + "\n")
-    new_b64 = base64.b64encode(new_content.encode("utf-8")).decode("utf-8")
-
-    payload = {
-        "message": f"log price sent {line_obj.get('date')}",
-        "content": new_b64,
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    u = requests.put(api, headers=headers, json=payload, timeout=30)
-    if u.status_code not in (200, 201):
-        raise ValueError(f"GitHub write failed: {u.status_code} {u.text}")
-
-
 # ---------------- UI ----------------
 st.set_page_config(page_title="ISOCH Price Poster Generator", layout="centered")
 st.markdown("## ISOCH Price Poster Generator (Purchase → Sales)")
-st.caption("Upload Excel → Select destinations → Generate Master Table + Posters → Email to Sales")
+st.caption("Upload Excel → Map destinations → Generate Master Table + Posters → Email + GitHub Log")
+
+# Load mapping (GitHub)
+mapping = {}
+try:
+    mapping = load_mapping_from_github()
+except Exception as e:
+    st.warning(f"Mapping load warning: {e} (You can still generate/send; mapping edits need GitHub write access.)")
 
 excel = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-
 df = None
 destinations = []
 if excel:
@@ -348,6 +363,24 @@ if excel:
 
 selected_destinations = st.multiselect("Select Destinations (multi)", destinations, default=destinations[:1] if destinations else [])
 
+# Mapping UI
+with st.expander("⚙️ Destination → Sales Recipients Mapping"):
+    st.info("Enter comma-separated emails for each destination. Saved in GitHub (solid persistence).")
+    if destinations:
+        d = st.selectbox("Destination", destinations)
+        current = mapping.get(d, DEFAULT_TEAM)
+        new_val = st.text_area("Recipients (comma-separated)", value=", ".join(current), height=90)
+        if st.button("Save Mapping to GitHub"):
+            try:
+                mapping[d] = [x.strip() for x in new_val.split(",") if x.strip()]
+                save_mapping_to_github(mapping)
+                st.success("Saved mapping to GitHub.")
+            except Exception as e:
+                st.error(f"Could not save mapping: {e}")
+    else:
+        st.write("Upload Excel to load destinations first.")
+
+# WhatsApp caption
 today_str = datetime.now().strftime("%d-%m-%Y")
 whatsapp_text = (
     f"📢 *ISOCH – Today’s Delivered Prices* ({today_str})\n"
@@ -355,9 +388,19 @@ whatsapp_text = (
     f"{DISCLAIMER}\n"
     f"📧 info@innovativesoch.com"
 )
-
-st.markdown("### WhatsApp Caption (Sales team can copy)")
+st.markdown("### WhatsApp Caption")
 st.code(whatsapp_text)
+
+# Show last logs
+with st.expander("🧾 Last Sent Logs (from GitHub)"):
+    try:
+        logs = tail_logs_from_github(20)
+        if not logs:
+            st.write("No logs yet.")
+        else:
+            st.json(logs)
+    except Exception as e:
+        st.write(f"Could not load logs: {e}")
 
 if st.button("🛠️ Generate & Send", type="primary"):
     if df is None or not selected_destinations:
@@ -368,20 +411,25 @@ if st.button("🛠️ Generate & Send", type="primary"):
         template = load_template()
         df_sel = df[df["Destination"].isin(selected_destinations)].copy()
 
-        # Master table image
+        # Build Master + posters
         master_png = build_master_table_image(template, df_sel, today_str)
 
-        # Destination posters
         attachments = {f"ISOCH_MASTER_{today_str}.png": master_png}
+
+        # Collect recipients based on mapping
+        all_recipients = set()
         for dest in selected_destinations:
+            recips = mapping.get(dest, DEFAULT_TEAM)
+            for r in recips:
+                all_recipients.add(r)
+
             g = df_sel[df_sel["Destination"] == dest][["Product", "DeliveredPrice"]].copy()
             g = g.groupby("Product", as_index=False)["DeliveredPrice"].min().sort_values("Product")
-            email_line = "Email: " + " | ".join(DEFAULT_SALES_TEAM)
-            poster_bytes = build_destination_poster(template, dest, g, today_str, email_line)
-            attachments[f"ISOCH_{dest}_{today_str}.png"] = poster_bytes
+            email_line = "Email: " + " | ".join(sorted(set(recips)))
+            attachments[f"ISOCH_{dest}_{today_str}.png"] = build_destination_poster(template, dest, g, today_str, email_line)
 
-        # Email to sales team (your fixed list)
-        to_list = DEFAULT_SALES_TEAM
+        to_list = sorted(all_recipients) if all_recipients else DEFAULT_TEAM
+
         subject = f"ISOCH | Delivered Prices | {today_str}"
         body = (
             "Dear Team,\n\n"
@@ -389,24 +437,25 @@ if st.button("🛠️ Generate & Send", type="primary"):
             "- MASTER table (all selected destinations)\n"
             "- Destination posters\n\n"
             f"{DISCLAIMER}\n\n"
-            "Regards,\n"
-            "Innovative Soch\n"
+            "Regards,\nInnovative Soch\n"
         )
 
         send_email_with_attachments(to_list, subject, body, attachments)
 
-        # Log to GitHub ONLY after successful email
-        github_append_log_line({
-            "date": date.today().isoformat(),
-            "time": datetime.now().strftime("%H:%M"),
-            "by": "purchase",
-            "destinations": selected_destinations,
-            "attachments": list(attachments.keys()),
-        })
+        # GitHub log (after successful send)
+        try:
+            append_log_to_github({
+                "date": date.today().isoformat(),
+                "time": datetime.now().strftime("%H:%M"),
+                "by": "purchase",
+                "destinations": selected_destinations,
+                "recipients": to_list,
+            })
+        except Exception as e:
+            st.warning(f"Email sent, but logging failed: {e}")
 
-        st.success("✅ Sent to sales team + logged in GitHub.")
+        st.success("✅ Sent successfully.")
 
-        # Downloads (no ZIP)
         st.download_button(
             "⬇️ Download MASTER Table (PNG)",
             data=master_png,
